@@ -1,201 +1,134 @@
 #!/usr/bin/python3
 
-
+# Builtin imports
 import sock
-import translator
-
 import sys
-import html
 import json
-
+import yaml
 from time import time
-from nltk import sent_tokenize
 
+# 3rd party imports
+from nltk import sent_tokenize
+import configargparse
+
+# Self defined imports
+from translator import Translator
 from constraints import getPolitenessConstraints as getCnstrs
 from log import log
 
-# IP and port for the server
-MY_IP = '172.17.66.215'
-MY_PORT = 12346
 
-supportedStyles = { 'fml', 'inf', 'auto' }
-styleToDomain = { 'fml': 'ep', 'inf': 'os', 'auto': 'pc' }
-#supportedStyles = { "os", "un", "dg", "jr", "ep", "pc", "em", "nc" }
-supportedOutLangs = { 'et', 'lv', 'en', 'ru', 'fi', 'lt', 'de' }
-extraSupportedOutLangs = { 'est': 'et', 'lav': 'lv', 'eng': 'en', 'rus': 'ru', 'fin': 'fi', 'lit': 'lt', 'ger': 'de' }
-defaultStyle = 'auto'
-defaultOutLang = 'en'
+class NMT_Server:
+    def __init__(self, translator_engine: Translator):
+        self.engine = translator_engine
 
-USAGE_MSG = """\nUsage: nmtnazgul.py  translation_model  truecaser_model  segmenter_model [output_lang [output_style]]
-	
-	translation_model: path to a trained Sockeye model folder
-	truecaser_model: path to a trained TartuNLP truecaser model file
-	segmenter_model: path to a trained Google SentencePiece model file
-	
-Without the output language and any further parameters an NMT server is started; otherwise the script translates STDIN
-	
-	output_lang: output language (one of the following: {0})
-	output_style: output style (one of the following: {1}; default: {2})
-	
-Further info: http://github.com/tartunlp/nazgul\n\n""".format(", ".join(list(supportedOutLangs)), ", ".join(list(supportedStyles)), defaultStyle)
+    def parse_input(self, raw_msg):
+        try:
+            fullText = raw_msg['src']
+            raw_style, raw_out_lang = get_conf(raw_msg['conf'])
 
+            livesubs = "|" in fullText
 
-#############################################################################################
-###################################### STDIN and Server #####################################
-#############################################################################################
+            sentences = fullText.split("|") if livesubs else sent_tokenize(fullText)
+            delim = "|" if livesubs else " "
 
+        except KeyError:
+            sentences = raw_msg['sentences']
+            raw_style = raw_msg['outStyle']
+            raw_out_lang = raw_msg['outLang']
+            delim = False
 
-def getConf(rawConf):
-	style = 'auto'
-	outlang = 'en'
-	
-	for field in rawConf.split(','):
-		if field in supportedStyles:
-			style = field
-		if field in supportedOutLangs:
-			outlang = field
-		if field in extraSupportedOutLangs:
-			outlang = extraSupportedOutLangs[field]
-	
-	return style, outlang
+        if raw_out_lang not in supportedOutLangs:
+            # raise ValueError("out lang bad: " + rawOutLang)
+            raw_out_lang = defaultOutLang
 
+        outputLang = raw_out_lang
+        # outputStyle = styleToDomain[rawStyle]
+        outputStyle = None
 
-def parseInput(rawText):
-	global supportedStyles, defaultStyle, supportedOutLangs, defaultOutLang
-	
-	try:
-		fullText = rawText['src']
-		rawStyle, rawOutLang = getConf(rawText['conf'])
-		
-		livesubs = "|" in fullText
-		
-		sentences = fullText.split("|") if livesubs else sent_tokenize(fullText)
-		delim = "|" if livesubs else " "
-		
-	except KeyError:
-		sentences = rawText['sentences']
-		rawStyle = rawText['outStyle']
-		rawOutLang = rawText['outLang']
-		delim = False
-	
-	if rawStyle not in supportedStyles:
-		#raise ValueError("style bad: " + rawStyle)
-		rawStyle = defaultStyle
-	
-	if rawOutLang not in supportedOutLangs:
-		#raise ValueError("out lang bad: " + rawOutLang)
-		rawOutLang = defaultOutLang
-	
-	outputLang = rawOutLang
-	outputStyle = styleToDomain[rawStyle]
-	
-	return sentences, outputLang, outputStyle, delim
+        return sentences, outputLang, outputStyle, delim
+
+    def decode_request(self, raw_msg):
+        struct = json.loads(raw_msg.decode('utf-8'))
+
+        segments, output_lang, output_style, delim = self.parse_input(struct)
+
+        return segments, output_lang, output_style, delim
+
+    def encode_response(self, translation_list, delim):
+        translation_text = delim.join(translation_list)
+
+        # TODO: Check what to do with raw_trans and raw_input? Some legacy thing?
+        result = json.dumps({'final_trans': translation_text})
+
+        return bytes(result, 'utf-8')
+
+    def translation_wrapper(self, raw_msg):
+        segments, output_lang, output_style, delim = self.decode_request(raw_msg)
+
+        # TODO: Handle multiple out_languages, until then, just multiply one...
+        translations, _, _, _ = self.engine.translate(segments, [output_lang] * len(segments))
+
+        return self.encode_response(translations, delim)
+
+    def start_translation_server(self, ip, port):
+        log("started server")
+
+        # start listening as a socket server; apply serverTranslationFunc to incoming messages to generate the response
+        sock.startServer(self, port=port, host=ip)
 
 
-def decodeRequest(rawMessage):
-	struct = json.loads(rawMessage.decode('utf-8'))
-	
-	segments, outputLang, outputStyle, delim = parseInput(struct)
-	
-	return segments, outputLang, outputStyle, delim
+def get_conf(raw_conf):
+    style = 'auto'
+    outlang = 'en'
+
+    for field in raw_conf.split(','):
+        if field in supportedOutLangs:
+            outlang = field
+
+    return style, outlang
 
 
-def encodeResponse(translationList, delim):
-	translationText = delim.join(translationList)
-	
-	result = json.dumps({'raw_trans': ['-'],
-		'raw_input': ['-'],
-		'final_trans': translationText})
-	
-	return bytes(result, 'utf-8')
 
-
-def serverTranslationFunc(rawMessage, models):
-	segments, outputLang, outputStyle, delim = decodeRequest(rawMessage)
-	
-	translations, _, _, _ = translator.translate(models, segments, outputLang, outputStyle, getCnstrs())
-	
-	return encodeResponse(translations, delim)
-
-
-def startTranslationServer(models, ip, port):
-	log("started server")
-	
-	# start listening as a socket server; apply serverTranslationFunc to incoming messages to genereate the response
-	sock.startServer(serverTranslationFunc, (models,), port = port, host = ip)
-
-
-def translateStdinInBatches(models, outputLang, outputStyle):
-	"""Read lines from STDIN and treat each as a segment to translate;
-	translate them and print out tab-separated scores (decoder log-prob)
-	and the translation outputs"""
-	
-	#read STDIN as a list of segments
-	lines = [line.strip() for line in sys.stdin]
-	
-	#translate segments and get translations and scores
-	translations, scores, _, _ = translator.translate(models, lines, outputLang, outputStyle, getCnstrs())
-	
-	#print each score and translation, separated with a tab
-	for translation, score in zip(translations, scores):
-		print("{0}\t{1}".format(score, translation))
-
-
-#############################################################################################
-################################## Cmdline and main block ###################################
-#############################################################################################
-
-
-def readCmdlineModels():
-	"""Read translation, truecaser and segmenter model paths from cmdline;
-	show usage info if failed"""
-	
-	#This is a quick hack for reading cmdline args, should use argparse instead
-	try:
-		translationModelPath = sys.argv[1]
-		truecaserModelPath = sys.argv[2]
-		segmenterModelPath = sys.argv[3]
-	except IndexError:
-		sys.stderr.write(USAGE_MSG)
-		sys.exit(-1)
-	
-	return translationModelPath, truecaserModelPath, segmenterModelPath
-
-
-def readLangAndStyle():
-	"""Read output language and style off cmdline.
-	Language is optional -- if not given, a server is started.
-	Style is optional -- if not given, default (auto) is used."""
-	
-	# EAFP
-	try:
-		outputLanguage = sys.argv[4]
-		
-		try:
-			outputStyle = sys.argv[5]
-		except IndexError:
-			outputStyle = defaultStyle
-	
-	except IndexError:
-		outputLanguage = None
-		outputStyle = None
-	
-	return outputLanguage, outputStyle
 
 
 if __name__ == "__main__":
-	# read translation and preprocessing model paths off cmdline
-	modelPaths = readCmdlineModels()
-	
-	# read output language and style off cmdline -- both are optional and will be "None" if not given
-	olang, ostyle = readLangAndStyle()
-	
-	# load translation and preprocessing models using paths
-	models = translator.loadModels(*modelPaths)
-	
-	# if language is given, STDIN is translated; otherwise a server is started
-	if olang:
-		translateStdinInBatches(models, olang, ostyle)
-	else:
-		# when argparse is finally used, set MY_IP and MY_PORT to cmdline arguments
-		startTranslationServer(models, MY_IP, MY_PORT)
+    parser = configargparse.ArgParser(
+        description="Backend NMT server for Sockeye models. Further info: http://github.com/tartunlp/nazgul",
+        config_file_parser_class=configargparse.YAMLConfigFileParser,
+        default_config_files=["config/config.ini"]
+    )
+    parser.add_argument('--config', type=yaml.safe_load)
+    parser.add_argument("--models", "-m", required=True, type=str, help="Path to Sockeye model folder")
+    parser.add_argument("--spm_model", "-s", required=True, type=str,
+                        help="Path to trained Google SentencePiece model file")
+    parser.add_argument("--tc_model", "-t", type=str, default=None,
+                        help="Path to trained TartuNLP truecaser model file")
+    parser.add_argument("--cpu", default=False, action="store_true",
+                        help="Use CPU-s instead of GPU-s for serving")
+
+    parser.add_argument("--port", "-p", type=int, default=12345,
+                        help="Port to run the service on.")
+    parser.add_argument("--ip", "-i", type=str, default="127.0.0.1",
+                        help="IP to run the service on")
+
+    parser.add_argument("--langs", "-l", type=str, action="append",
+                        help="Comma separated string on supported languages.")
+    parser.add_argument("--domains", "-d", type=str, action="append",
+                        help="Comma separated string on supported domains.")
+
+    args = parser.parse_args()
+    print(args)
+
+    ### Legacy stuff
+    # read translation and preprocessing model paths off cmdline
+    # modelPaths = readCmdlineModels()
+
+    # read output language and style off cmdline -- both are optional and will be "None" if not given
+    # olang, ostyle = readLangAndStyle()
+    supportedOutLangs = args.langs
+    defaultOutLang = "et"
+    # load translation and preprocessing models using paths
+    translation_engine = Translator(args.models, args.spm_model, args.tc_model, args.cpu)
+
+    nmt_server = NMT_Server(translation_engine)
+    nmt_server.start_translation_server(args.ip, args.port)
